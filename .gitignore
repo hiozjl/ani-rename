@@ -4,9 +4,18 @@
 # 代码文件
 !*.py
 !*.md
+!*.txt
+!*.yml
 !.gitignore
+!Dockerfile
+!requirements.txt
+!docker-compose.yml
 
 # docs 目录（排除测试用的 nfo 文件）
 !docs/
 !docs/**
 *.nfo
+
+# 凭据 — 始终排除
+tmdb-api.txt
+anidb-auth.txt

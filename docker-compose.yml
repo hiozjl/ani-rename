@@ -1,0 +1,20 @@
+services:
+  ani-rename:
+    build: .
+    container_name: ani-rename
+    ports:
+      - "5800:5800"
+    volumes:
+      # 媒体目录（改成你的实际路径）
+      - /mnt/media/里番:/media:ro
+      # API 凭据（放在项目根目录下）
+      - ./tmdb-api.txt:/app/tmdb-api.txt:ro
+      # AniDB 凭据（可选）
+      - ./anidb-auth.txt:/app/anidb-auth.txt:ro
+      # AniDB 缓存持久化
+      - ./anidb-title-cache:/app/anidb-title-cache
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - ANIDB_USERNAME=${ANIDB_USERNAME:-}
+      - ANIDB_PASSWORD=${ANIDB_PASSWORD:-}
+    restart: unless-stopped

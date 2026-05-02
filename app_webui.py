@@ -34,9 +34,10 @@ from tmdb_rename import (
     summarize,
 )
 
-ROOT = Path(__file__).parent.resolve()
-TMDB_KEY_FILE = ROOT / "tmdb-api.txt"
-ANIDB_CACHE = ROOT / "anidb-title-cache" / "anime-titles.xml.gz"
+APP_DIR = Path(__file__).parent.resolve()
+MEDIA_ROOT = APP_DIR  # 默认等于代码目录，可通过 --root 覆盖
+TMDB_KEY_FILE = APP_DIR / "tmdb-api.txt"
+ANIDB_CACHE = APP_DIR / "anidb-title-cache" / "anime-titles.xml.gz"
 
 app = flask.Flask(__name__)
 
@@ -69,7 +70,7 @@ class ScanProgress:
 
 _scan_progress = ScanProgress()
 _scan_cache: dict[str, dict] = {}  # path -> serialized scan result
-_CACHE_FILE = ROOT / "webui_scan_cache.json"
+_CACHE_FILE = APP_DIR / "webui_scan_cache.json"
 
 
 def _save_cache():
@@ -100,7 +101,7 @@ def _get_anime_folders() -> list[Path]:
             ".tmdb-apply-test", ".tmdb-cli-test", ".claude", ".superpowers"}
     try:
         return sorted(
-            [p for p in ROOT.iterdir() if p.is_dir() and p.name not in skip],
+            [p for p in MEDIA_ROOT.iterdir() if p.is_dir() and p.name not in skip],
             key=lambda p: p.name,
         )
     except OSError:
@@ -620,7 +621,7 @@ def index():
     folders = _get_anime_folders()
     return flask.render_template_string(HTML_TEMPLATE,
                                         folders=[p.name for p in folders],
-                                        root_path=str(ROOT))
+                                        root_path=str(MEDIA_ROOT))
 
 
 # ── error handler ──────────────────────────────────────────────────────────
@@ -1209,12 +1210,16 @@ def main():
     parser = argparse.ArgumentParser(description="里番重命名 WebUI")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=5800, help="监听端口")
+    parser.add_argument("--root", default=str(APP_DIR), help="媒体库根目录（默认: 代码所在目录）")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
     args = parser.parse_args()
 
+    global MEDIA_ROOT
+    MEDIA_ROOT = Path(args.root).resolve()
+
     print(f"🎬 里番重命名 WebUI")
     print(f"   地址: http://{args.host}:{args.port}")
-    print(f"   目录: {ROOT}")
+    print(f"   目录: {MEDIA_ROOT}")
     print(f"   TMDB: {'✅ 已配置' if _api_key() else '❌ 未配置'}")
     print(f"   AniDB缓存: {'✅ 存在' if ANIDB_CACHE.exists() else '❌ 未找到'}")
     print(f"   按 Ctrl+C 停止")
