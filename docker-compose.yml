@@ -5,8 +5,9 @@ services:
     ports:
       - "5800:5800"
     volumes:
-      # 媒体目录（改成你的实际路径）
-      - /mediapath:/media:ro
+      # 媒体目录（默认只读，适合先扫描/预览）
+      # 需要在 WebUI 执行改名时，设置 MEDIA_VOLUME_MODE=rw 后再启动。
+      - ${MEDIA_ROOT:-/mediapath}:/media:${MEDIA_VOLUME_MODE:-ro}
       # API 凭据（放在项目根目录下）
       - ./tmdb-api.txt:/app/tmdb-api.txt:ro
       # AniDB 凭据（可选）

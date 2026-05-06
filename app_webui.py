@@ -45,6 +45,9 @@ app = flask.Flask(__name__)
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _read_tmdb_key() -> str:
+    env_key = os.environ.get("TMDB_API_KEY", "").strip()
+    if env_key:
+        return env_key
     try:
         return TMDB_KEY_FILE.read_text(encoding="utf-8").strip()
     except Exception:
@@ -54,6 +57,20 @@ def _read_tmdb_key() -> str:
 def _api_key():
     key = _read_tmdb_key()
     return key if re.fullmatch(r"[0-9a-fA-F]{32}", key or "") else ""
+
+
+def _media_path(path_str: str) -> Path | None:
+    """Resolve and constrain user-provided paths to the configured media root."""
+    if not path_str:
+        return None
+    try:
+        root = MEDIA_ROOT.resolve()
+        path = Path(path_str).resolve()
+        if path == root or path.is_relative_to(root):
+            return path
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return None
 
 
 # ── background scanner ─────────────────────────────────────────────────────
@@ -340,11 +357,11 @@ def api_scan_one():
     data = flask.request.get_json(silent=True) or {}
     path_str = data.get("path", "")
     series_title = data.get("series_title", "")
-    p = Path(path_str)
-    if not p.is_dir():
+    p = _media_path(path_str)
+    if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
     result = _scan_one_impl(p, enrich=True, override_title=series_title)
-    _scan_cache[path_str] = result
+    _scan_cache[str(p)] = result
     _save_cache()
     return result
 
@@ -355,8 +372,8 @@ def api_preview_one():
     path_str = data.get("path", "")
     series_title = data.get("series_title", "")
 
-    p = Path(path_str)
-    if not p.is_dir():
+    p = _media_path(path_str)
+    if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
     try:
@@ -397,8 +414,8 @@ def api_apply_one():
     path_str = data.get("path", "")
     series_title = data.get("series_title", "")
 
-    p = Path(path_str)
-    if not p.is_dir():
+    p = _media_path(path_str)
+    if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
     try:
@@ -445,11 +462,13 @@ def api_rename_folder():
 
     from tmdb_rename import safe_name
     new_name = safe_name(new_name)
-    src = Path(path_str)
-    dst = src.parent / new_name
+    src = _media_path(path_str)
 
-    if not src.is_dir():
+    if not src or not src.is_dir():
         return {"error": "源目录不存在"}, 404
+    dst = src.parent / new_name
+    if not (dst.resolve().parent == MEDIA_ROOT.resolve()):
+        return {"error": "目标目录不在媒体根目录下"}, 400
     if dst.exists():
         return {"error": f"目标目录已存在: {new_name}"}, 409
 
@@ -468,8 +487,17 @@ def api_rename_folder():
 def api_apply_all():
     data = flask.request.get_json(silent=True) or {}
     overrides = data.get("overrides", {})
+    selected_paths = data.get("paths", [])
 
-    folders = _get_anime_folders()
+    if selected_paths:
+        folders = []
+        for item in selected_paths:
+            p = _media_path(str(item))
+            if not p or not p.is_dir():
+                return {"error": f"无效路径: {item}"}, 400
+            folders.append(p)
+    else:
+        return {"error": "请选择要应用的项目"}, 400
     results = []
     total_renamed = 0
     total_errors = 0
@@ -523,8 +551,8 @@ def api_download_nfo():
     data = flask.request.get_json(silent=True) or {}
     path_str = data.get("path", "")
 
-    p = Path(path_str)
-    if not p.is_dir():
+    p = _media_path(path_str)
+    if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
     api_key = _api_key()
@@ -560,8 +588,8 @@ def api_download_poster():
     data = flask.request.get_json(silent=True) or {}
     path_str = data.get("path", "")
 
-    p = Path(path_str)
-    if not p.is_dir():
+    p = _media_path(path_str)
+    if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
     cached = _scan_cache.get(path_str, {})
@@ -745,6 +773,7 @@ let folders = [];
 let currentFilter = 'all';
 let searchTerm = '';
 let scanPollTimer = null;
+let selectedPaths = new Set();
 
 function showToast(msg, type='info') {
   const t = document.getElementById('toast');
@@ -803,13 +832,23 @@ function renderCard(item) {
 
   const header = document.createElement('div');
   header.className = 'card-header';
+  const selectBox = document.createElement('input');
+  selectBox.type = 'checkbox';
+  selectBox.className = 'form-check-input mt-1';
+  selectBox.title = '勾选后可批量应用';
+  selectBox.disabled = item.status !== 'rename';
+  selectBox.checked = item.status === 'rename' && selectedPaths.has(item.path);
+  selectBox.onchange = function() {
+    if (selectBox.checked) selectedPaths.add(item.path);
+    else selectedPaths.delete(item.path);
+  };
   const nameDiv = document.createElement('div');
   nameDiv.className = 'folder-name';
   nameDiv.textContent = item.name;
   const badge = document.createElement('span');
   badge.className = `badge-status badge bg-${badgeCls(item.status)}`;
   badge.textContent = statusLabel(item);
-  header.append(nameDiv, badge);
+  header.append(selectBox, nameDiv, badge);
 
   const meta = document.createElement('div');
   meta.className = 'folder-meta';
@@ -966,6 +1005,9 @@ async function refreshFolders() {
     const r = await fetch('/api/folders');
     const d = await r.json();
     folders = d.items || [];
+    if (selectedPaths.size === 0) {
+      selectedPaths = new Set(folders.filter(f => f.status === 'rename').map(f => f.path));
+    }
     renderGrid(folders);
   } catch(e) { showToast('加载失败: '+e.message, 'error'); }
 }
@@ -1042,6 +1084,8 @@ async function scanOne(path, input) {
     const idx = folders.findIndex(f => f.path === path);
     if (idx >= 0) {
       folders[idx] = { ...folders[idx], ...d, scanned: true };
+      if (folders[idx].status === 'rename') selectedPaths.add(path);
+      else selectedPaths.delete(path);
       refreshSingleCard(folders[idx]);
       updateSummary();
     } else {
@@ -1064,6 +1108,8 @@ async function previewOne(path, input) {
       folders[idx].status = d.status||'';
       folders[idx].top_candidate = d.top_candidate;
       folders[idx].scanned = true;
+      if (folders[idx].status === 'rename') selectedPaths.add(path);
+      else selectedPaths.delete(path);
       refreshSingleCard(folders[idx]);
       updateSummary();
     }
@@ -1099,12 +1145,22 @@ async function renameFolder(path, input) {
 }
 
 async function applyAll() {
-  if (!confirm('确定要应用所有改名的操作吗？')) return;
+  const checked = Array.from(document.querySelectorAll('.folder-card input[type="checkbox"]:checked'));
+  const paths = checked.map(box => box.closest('[data-path]').dataset.path);
+  if (paths.length === 0) { showToast('请先勾选要批量应用的项目', 'warning'); return; }
+  const overrides = {};
+  for (const path of paths) {
+    const card = document.querySelector(`[data-path="${CSS.escape(path)}"]`);
+    const input = card ? card.querySelector('.folder-name-input') : null;
+    if (input && input.value.trim()) overrides[path] = input.value.trim();
+  }
+  if (!confirm(`确定要应用 ${paths.length} 个已勾选项目的改名操作吗？`)) return;
   showToast('✅ 正在批量执行改名...', 'info');
   try {
-    const r = await fetch('/api/apply-all', {method:'POST', headers:{'Content-Type':'application/json'}});
+    const r = await fetch('/api/apply-all', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({paths, overrides})});
     const d = await r.json();
     if (d.error) { showToast(d.error, 'error'); return; }
+    for (const path of paths) selectedPaths.delete(path);
     showToast(`全部完成: 重命名 ${d.total_renamed} 个, 错误 ${d.total_errors} 个`, d.total_errors?'warning':'success');
     await refreshFolders();
   } catch(e) { showToast('应用失败: '+e.message, 'error'); }
@@ -1136,7 +1192,7 @@ async function downloadPoster(path, btn) {
     btn.textContent = orig; btn.disabled = false;
     if (d.error) { showToast(d.error, 'error'); return; }
     if (d.note === '已存在') showToast('🖼️ 海报已存在', 'info');
-    else showToast(`🖼️ 海报已下载 (${(d.size/1024).toFixed(0)}KB)`, 'success');
+    else showToast(`🖼️ 海报已下载: ${d.count||0} 个文件`, 'success');
     await refreshFolders();
   } catch(e) { btn.textContent = orig; btn.disabled = false; showToast('海报下载失败: '+e.message, 'error'); }
 }
