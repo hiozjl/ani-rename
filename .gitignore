@@ -19,3 +19,4 @@
 # 凭据 — 始终排除
 tmdb-api.txt
 anidb-auth.txt
+Github_token.txt
