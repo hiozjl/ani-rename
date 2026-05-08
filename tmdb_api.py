@@ -124,7 +124,8 @@ def enrich_with_tmdb(scan: SeriesScan, api_key: str, language: str) -> None:
         for result in results[:5]:
             season_data = tmdb_season_details(result["id"], 1, api_key, language) if scan.episode_count else None
             candidate = score_candidate(scan, result, season_data)
-            current = candidates.get(candidate.tmdb_id)
+            key = (candidate.source, candidate.source_id)
+            current = candidates.get(key)
             if current is None or candidate.score > current.score:
-                candidates[candidate.tmdb_id] = candidate
+                candidates[key] = candidate
     scan.candidates = sorted(candidates.values(), key=lambda item: item.score, reverse=True)[:5]

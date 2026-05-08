@@ -127,9 +127,10 @@ def enrich_with_bangumi(scan: SeriesScan) -> None:
             candidate = score_bangumi_candidate(scan, result)
             if candidate is None:
                 continue
-            current = candidates.get(candidate.tmdb_id)
+            key = (candidate.source, candidate.source_id)
+            current = candidates.get(key)
             if current is None or candidate.score > current.score:
-                candidates[candidate.tmdb_id] = candidate
+                candidates[key] = candidate
     scan.candidates = sorted(
         [*scan.candidates, *candidates.values()],
         key=lambda item: item.score, reverse=True,

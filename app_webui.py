@@ -88,13 +88,16 @@ class ScanProgress:
 _scan_progress = ScanProgress()
 _scan_cache: dict[str, dict] = {}  # path -> serialized scan result
 _CACHE_FILE = APP_DIR / "webui_scan_cache.json"
+_cache_lock = threading.Lock()
+_progress_lock = threading.Lock()
 
 
 def _save_cache():
     try:
-        serializable = {k: {kk: vv for kk, vv in v.items()
-                            if kk not in ("top_candidate", "operations") or vv is not None}
-                        for k, v in _scan_cache.items()}
+        with _cache_lock:
+            serializable = {k: {kk: vv for kk, vv in v.items()
+                                if kk not in ("top_candidate", "operations") or vv is not None}
+                            for k, v in _scan_cache.items()}
         _CACHE_FILE.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -104,8 +107,9 @@ def _load_cache():
     if _CACHE_FILE.exists():
         try:
             data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
-            _scan_cache.clear()
-            _scan_cache.update(data)
+            with _cache_lock:
+                _scan_cache.clear()
+                _scan_cache.update(data)
         except Exception:
             pass
 
@@ -138,7 +142,8 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
         scan.title_hint = override_title
 
     # 尝试用缓存的 ID 直接匹配（不管文件夹改了什么名字都能对上）
-    prev = _scan_cache.get(str(p), {})
+    with _cache_lock:
+        prev = _scan_cache.get(str(p), {})
     prev_cand = prev.get("top_candidate")
     if prev_cand and prev_cand.get("source_id"):
         from tmdb_scan_preview import Candidate
@@ -200,7 +205,7 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
         try:
             enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     ev = evaluate_scan(scan, min_score=0.65,
                        series_title_source="tmdb", allow_fallback=True)
@@ -225,16 +230,18 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
 def _scan_background(mode: str = "full"):
     """mode: 'full' → scan everything; 'incremental' → only scan unmatched/changed items"""
     global _scan_progress
-    _scan_progress = ScanProgress(running=True)
+    with _progress_lock:
+        _scan_progress = ScanProgress(running=True)
+        _scan_progress.results = []
     folders = _get_anime_folders()
-    _scan_progress.results = []
 
     # In incremental mode, pre-filter: skip items with good cached matches
     scan_folders: list[Path] = []
     skipped_count = 0
     for p in folders:
         path_str = str(p)
-        cached = _scan_cache.get(path_str, {})
+        with _cache_lock:
+            cached = _scan_cache.get(path_str, {})
         if mode == "incremental" and cached:
             # Skip items already matched with a candidate and unchanged
             if cached.get("top_candidate") and cached.get("status") in ("noop", "rename"):
@@ -243,22 +250,25 @@ def _scan_background(mode: str = "full"):
                     fp = quick_fingerprint(p)
                     cached_fp = cached.get("fingerprint", {})
                     if not fingerprint_changed({"fingerprint": cached_fp}, fp):
-                        _scan_progress.results.append(cached)
+                        with _progress_lock:
+                            _scan_progress.results.append(cached)
                         skipped_count += 1
                         continue
                 except Exception:
                     pass  # on fingerprint error, just re-scan
         scan_folders.append(p)
 
-    _scan_progress.total = len(folders)  # total includes skipped items for accurate progress
+    with _progress_lock:
+        _scan_progress.total = len(folders)
     if skipped_count:
         print(f"Incremental scan: skipping {skipped_count} matched items, scanning {len(scan_folders)}")
 
     for i, p in enumerate(scan_folders):
-        if _scan_progress.cancel:
-            break
-        _scan_progress.current = skipped_count + i + 1  # 1-indexed, includes already-skipped
-        _scan_progress.current_name = p.name
+        with _progress_lock:
+            if _scan_progress.cancel:
+                break
+            _scan_progress.current = skipped_count + i + 1
+            _scan_progress.current_name = p.name
         try:
             r = _scan_one_impl(p, enrich=True)
             # Preserve fingerprint for future incremental checks
@@ -266,15 +276,21 @@ def _scan_background(mode: str = "full"):
                 r["fingerprint"] = quick_fingerprint(p)
             except Exception:
                 pass
-            _scan_cache[str(p)] = r
-            _scan_progress.results.append(r)
-            _save_cache()
+            with _cache_lock:
+                _scan_cache[str(p)] = r
+            with _progress_lock:
+                _scan_progress.results.append(r)
+            if i % 10 == 0:
+                _save_cache()
         except Exception as exc:
             r = {"path": str(p), "name": p.name, "status": "error",
                  "reason": str(exc)[:200]}
-            _scan_progress.results.append(r)
+            with _progress_lock:
+                _scan_progress.results.append(r)
 
-    _scan_progress.running = False
+    with _progress_lock:
+        _scan_progress.running = False
+    _save_cache()
 
 
 # ── API routes ─────────────────────────────────────────────────────────────
@@ -284,7 +300,8 @@ def api_folders():
     folders = _get_anime_folders()
     items = []
     for p in folders:
-        cached = _scan_cache.get(str(p), {})
+        with _cache_lock:
+            cached = _scan_cache.get(str(p), {})
         # check existence of assets
         nfo_exists = (p / "tvshow.nfo").exists()
         poster_exists = (p / "poster.jpg").exists()
@@ -328,7 +345,8 @@ def api_scan_incremental():
 
 @app.route("/api/scan-status")
 def api_scan_status():
-    s = _scan_progress
+    with _progress_lock:
+        s = _scan_progress
     return {
         "running": s.running,
         "total": s.total,
@@ -340,13 +358,15 @@ def api_scan_status():
 
 @app.route("/api/scan-cancel", methods=["POST"])
 def api_scan_cancel():
-    _scan_progress.cancel = True
+    with _progress_lock:
+        _scan_progress.cancel = True
     return {"status": "cancelling"}
 
 
 @app.route("/api/scan-results")
 def api_scan_results():
-    s = _scan_progress
+    with _progress_lock:
+        s = _scan_progress
     summary = summarize(s.results) if s.results else {}
     return {"results": s.results, "summary": summary, "total": len(s.results),
             "done": not s.running}
@@ -361,7 +381,8 @@ def api_scan_one():
     if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
     result = _scan_one_impl(p, enrich=True, override_title=series_title)
-    _scan_cache[str(p)] = result
+    with _cache_lock:
+        _scan_cache[str(p)] = result
     _save_cache()
     return result
 
@@ -385,7 +406,7 @@ def api_preview_one():
         try:
             enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     ev = evaluate_scan(scan, min_score=0.65,
                        series_title_source="tmdb", allow_fallback=True)
@@ -427,7 +448,7 @@ def api_apply_one():
         try:
             enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     ev = evaluate_scan(scan, min_score=0.65,
                        series_title_source="tmdb", allow_fallback=True)
@@ -446,7 +467,8 @@ def api_apply_one():
     ev["applied_renamed"] = renamed
     ev["applied_errors"] = errors
 
-    _scan_cache.pop(path_str, None)
+    with _cache_lock:
+        _scan_cache.pop(path_str, None)
     _save_cache()
     return ev
 
@@ -462,6 +484,8 @@ def api_rename_folder():
 
     from tmdb_rename import safe_name
     new_name = safe_name(new_name)
+    if not new_name:
+        return {"error": "重命名后的名称为空，请检查是否包含特殊字符"}, 400
     src = _media_path(path_str)
 
     if not src or not src.is_dir():
@@ -474,8 +498,9 @@ def api_rename_folder():
 
     try:
         src.rename(dst)
-        _scan_cache.pop(str(src), None)
-        _scan_cache.pop(str(dst), None)
+        with _cache_lock:
+            _scan_cache.pop(str(src), None)
+            _scan_cache.pop(str(dst), None)
         _save_cache()
         return {"success": True, "old_path": str(src), "new_path": str(dst),
                 "new_name": new_name}
@@ -518,7 +543,7 @@ def api_apply_all():
             try:
                 enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
         ev = evaluate_scan(scan, min_score=0.65,
                            series_title_source="tmdb", allow_fallback=True)
@@ -539,7 +564,8 @@ def api_apply_all():
         ev["applied_renamed"] = renamed
         ev["applied_errors"] = errors
         results.append(ev)
-        _scan_cache.pop(path_str, None)
+        with _cache_lock:
+            _scan_cache.pop(path_str, None)
 
     _save_cache()
     return {"total": len(results), "total_renamed": total_renamed,
@@ -592,7 +618,8 @@ def api_download_poster():
     if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
-    cached = _scan_cache.get(path_str, {})
+    with _cache_lock:
+        cached = _scan_cache.get(path_str, {})
     top = cached.get("top_candidate")
     if not top:
         return {"error": "该文件夹没有匹配的元数据，请先扫描"}, 400
@@ -768,7 +795,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
 </div>
 
 <script>
-const ROOT_PATH = "{{ root_path|safe }}";
+const ROOT_PATH = {{ root_path|tojson }};
 let folders = [];
 let currentFilter = 'all';
 let searchTerm = '';
@@ -1264,7 +1291,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="里番重命名 WebUI")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，局域网访问设为 0.0.0.0）")
     parser.add_argument("--port", type=int, default=5800, help="监听端口")
     parser.add_argument("--root", default=str(APP_DIR), help="媒体库根目录（默认: 代码所在目录）")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")

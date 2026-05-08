@@ -334,6 +334,16 @@ def scan_series(path: Path) -> SeriesScan:
         if alias and alias not in queries:
             queries.append(alias)
 
+    # Truncate excessive search variants — more than 8 rarely helps
+    seen = set()
+    deduped = []
+    for q in queries:
+        low = q.lower()
+        if low not in seen:
+            seen.add(low)
+            deduped.append(q)
+    queries = deduped[:8]
+
     return SeriesScan(
         path=str(path),
         structure=structure,

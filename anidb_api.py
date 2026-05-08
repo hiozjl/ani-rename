@@ -244,7 +244,7 @@ def score_anidb_candidate(scan: SeriesScan, result: dict[str, Any]) -> Candidate
 
 
 def enrich_with_anidb_client(scan: SeriesScan, client: AniDBUdpClient) -> None:
-    candidates: dict[int, Candidate] = {}
+    candidates: dict[tuple[str, str], Candidate] = {}
     for query in scan.query_variants:
         if not query:
             continue
@@ -256,9 +256,10 @@ def enrich_with_anidb_client(scan: SeriesScan, client: AniDBUdpClient) -> None:
         if not result:
             continue
         candidate = score_anidb_candidate(scan, result)
-        current = candidates.get(candidate.tmdb_id)
+        key = (candidate.source, candidate.source_id)
+        current = candidates.get(key)
         if current is None or candidate.score > current.score:
-            candidates[candidate.tmdb_id] = candidate
+            candidates[key] = candidate
     scan.candidates = sorted([*scan.candidates, *candidates.values()], key=lambda item: item.score, reverse=True)[:5]
 
 
@@ -454,15 +455,16 @@ def enrich_scans_with_anidb_title_dump(scans: list[SeriesScan], cache_path: Path
             scan.reason_flags.append("anidb_title_dump_unavailable")
         return
     try:
-        per_scan: list[dict[int, Candidate]] = [dict() for _ in eligible]
+        per_scan: list[dict[tuple[str, str], Candidate]] = [dict() for _ in eligible]
         for aid, titles in iter_anidb_title_dump(dump_path):
             for index, scan in enumerate(eligible):
                 candidate = score_anidb_title_dump_candidate(scan, aid, titles)
                 if not candidate:
                     continue
-                current = per_scan[index].get(candidate.tmdb_id)
+                key = (candidate.source, candidate.source_id)
+                current = per_scan[index].get(key)
                 if current is None or candidate.score > current.score:
-                    per_scan[index][candidate.tmdb_id] = candidate
+                    per_scan[index][key] = candidate
         for scan, candidates in zip(eligible, per_scan):
             scan.candidates = sorted([*scan.candidates, *candidates.values()], key=lambda item: item.score, reverse=True)[:5]
             if candidates:

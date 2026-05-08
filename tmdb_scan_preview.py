@@ -176,11 +176,15 @@ def quick_fingerprint(path: Path) -> dict[str, Any]:
         newest_mtime = max(p.stat().st_mtime for p in entries)
     except OSError:
         newest_mtime = 0.0
+    # hash of all file/subdir names to detect renames
+    all_names = sorted(p.name for p in entries)
+    name_hash = hash(tuple(all_names))
     return {
         "structure": structure,
         "entry_count": entry_count,
         "episode_count": episode_count,
         "newest_mtime": newest_mtime,
+        "name_hash": name_hash,
     }
 
 
@@ -194,6 +198,9 @@ def fingerprint_changed(prev_item: dict[str, Any], current_fp: dict[str, Any]) -
     prev_eps = prev_fp.get("episode_numbers", [])
     cur_eps = current_fp.get("episode_numbers", [])
     if prev_eps != cur_eps:
+        return True
+    # detect file renames (same count but different names)
+    if prev_fp.get("name_hash") != current_fp.get("name_hash"):
         return True
     return False
 
