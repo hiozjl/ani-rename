@@ -439,16 +439,58 @@ def api_apply_one():
     if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
+    with _cache_lock:
+        cached = _scan_cache.get(path_str, {})
+
+    # Fast path: use cached operations directly when no custom series_title
+    if cached and cached.get("operations") and not series_title:
+        ev = {
+            "path": cached["path"],
+            "status": cached.get("status", ""),
+            "reason": cached.get("reason", ""),
+            "reason_flags": cached.get("reason_flags", []),
+            "series_title": cached.get("series_title", ""),
+            "top_candidate": cached.get("top_candidate"),
+            "operations": [op for op in cached["operations"] if op["status"] != "rename_folder"],
+        }
+        renamed, errors = apply_operations([ev], apply=True)
+        ev["applied_renamed"] = renamed
+        ev["applied_errors"] = errors
+        with _cache_lock:
+            _scan_cache.pop(path_str, None)
+        _save_cache()
+        return ev
+
+    # Slow path: re-scan needed (custom title or no cache)
     try:
         scan = scan_series(p)
     except Exception as exc:
         return {"error": str(exc)}, 500
 
+    # Reuse cached candidate to avoid network API calls
     if not scan.candidates:
-        try:
-            enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
-        except Exception:
-            print(traceback.format_exc(), flush=True)
+        cached_cand = cached.get("top_candidate")
+        if cached_cand:
+            from tmdb_scan_preview import Candidate
+            scan.candidates = [Candidate(
+                tmdb_id=cached_cand.get("tmdb_id", 0),
+                name=cached_cand.get("name", ""),
+                original_name=cached_cand.get("original_name", ""),
+                first_air_date=cached_cand.get("first_air_date", ""),
+                original_language=cached_cand.get("original_language", ""),
+                overview=cached_cand.get("overview", ""),
+                score=cached_cand.get("score", 0.99),
+                reasons=["reused_cached_candidate"],
+                source=cached_cand.get("source", ""),
+                source_id=cached_cand.get("source_id", ""),
+                zh_title=cached_cand.get("zh_title", ""),
+                raw_data=cached_cand.get("raw_data"),
+            )]
+        else:
+            try:
+                enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
+            except Exception:
+                print(traceback.format_exc(), flush=True)
 
     ev = evaluate_scan(scan, min_score=0.65,
                        series_title_source="tmdb", allow_fallback=True)
@@ -531,6 +573,31 @@ def api_apply_all():
         path_str = str(p)
         series_title = overrides.get(path_str, "")
 
+        with _cache_lock:
+            cached = _scan_cache.get(path_str, {})
+
+        # Fast path: use cached operations directly when no custom series_title
+        if cached and cached.get("operations") and not series_title:
+            ev = {
+                "path": cached["path"],
+                "status": cached.get("status", ""),
+                "reason": cached.get("reason", ""),
+                "reason_flags": cached.get("reason_flags", []),
+                "series_title": cached.get("series_title", ""),
+                "top_candidate": cached.get("top_candidate"),
+                "operations": [op for op in cached["operations"] if op["status"] != "rename_folder"],
+            }
+            renamed, errors = apply_operations([ev], apply=True)
+            total_renamed += renamed
+            total_errors += errors
+            ev["applied_renamed"] = renamed
+            ev["applied_errors"] = errors
+            results.append(ev)
+            with _cache_lock:
+                _scan_cache.pop(path_str, None)
+            continue
+
+        # Slow path: re-scan needed
         try:
             scan = scan_series(p)
         except Exception:
@@ -539,11 +606,30 @@ def api_apply_all():
             total_errors += 1
             continue
 
+        # Reuse cached candidate to avoid network API calls
         if not scan.candidates:
-            try:
-                enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
-            except Exception:
-                print(traceback.format_exc(), flush=True)
+            cached_cand = cached.get("top_candidate")
+            if cached_cand:
+                from tmdb_scan_preview import Candidate
+                scan.candidates = [Candidate(
+                    tmdb_id=cached_cand.get("tmdb_id", 0),
+                    name=cached_cand.get("name", ""),
+                    original_name=cached_cand.get("original_name", ""),
+                    first_air_date=cached_cand.get("first_air_date", ""),
+                    original_language=cached_cand.get("original_language", ""),
+                    overview=cached_cand.get("overview", ""),
+                    score=cached_cand.get("score", 0.99),
+                    reasons=["reused_cached_candidate"],
+                    source=cached_cand.get("source", ""),
+                    source_id=cached_cand.get("source_id", ""),
+                    zh_title=cached_cand.get("zh_title", ""),
+                    raw_data=cached_cand.get("raw_data"),
+                )]
+            else:
+                try:
+                    enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
+                except Exception:
+                    print(traceback.format_exc(), flush=True)
 
         ev = evaluate_scan(scan, min_score=0.65,
                            series_title_source="tmdb", allow_fallback=True)
