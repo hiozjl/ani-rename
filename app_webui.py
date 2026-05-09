@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -227,25 +228,25 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
     }
 
 
+MAX_SCAN_WORKERS = 5
+
 def _scan_background(mode: str = "full"):
     """mode: 'full' → scan everything; 'incremental' → only scan unmatched/changed items"""
     global _scan_progress
     with _progress_lock:
         _scan_progress = ScanProgress(running=True)
         _scan_progress.results = []
-    folders = _get_anime_folders()
+    all_folders = _get_anime_folders()
 
     # In incremental mode, pre-filter: skip items with good cached matches
     scan_folders: list[Path] = []
     skipped_count = 0
-    for p in folders:
+    for p in all_folders:
         path_str = str(p)
         with _cache_lock:
             cached = _scan_cache.get(path_str, {})
         if mode == "incremental" and cached:
-            # Skip items already matched with a candidate and unchanged
             if cached.get("top_candidate") and cached.get("status") in ("noop", "rename"):
-                # Quick fingerprint check
                 try:
                     fp = quick_fingerprint(p)
                     cached_fp = cached.get("fingerprint", {})
@@ -255,38 +256,48 @@ def _scan_background(mode: str = "full"):
                         skipped_count += 1
                         continue
                 except Exception:
-                    pass  # on fingerprint error, just re-scan
+                    pass
         scan_folders.append(p)
 
+    total = len(all_folders)
     with _progress_lock:
-        _scan_progress.total = len(folders)
+        _scan_progress.total = total
     if skipped_count:
         print(f"Incremental scan: skipping {skipped_count} matched items, scanning {len(scan_folders)}")
 
-    for i, p in enumerate(scan_folders):
-        with _progress_lock:
-            if _scan_progress.cancel:
-                break
-            _scan_progress.current = skipped_count + i + 1
-            _scan_progress.current_name = p.name
-        try:
-            r = _scan_one_impl(p, enrich=True)
-            # Preserve fingerprint for future incremental checks
+    done_count = skipped_count
+    with ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS) as executor:
+        future_to_path = {
+            executor.submit(_scan_one_impl, p, True): str(p)
+            for p in scan_folders
+        }
+        for future in as_completed(future_to_path):
+            path_str = future_to_path[future]
+            with _progress_lock:
+                if _scan_progress.cancel:
+                    for f in future_to_path:
+                        f.cancel()
+                    break
+                done_count += 1
+                _scan_progress.current = done_count
+                _scan_progress.current_name = Path(path_str).name
             try:
-                r["fingerprint"] = quick_fingerprint(p)
-            except Exception:
-                pass
-            with _cache_lock:
-                _scan_cache[str(p)] = r
-            with _progress_lock:
-                _scan_progress.results.append(r)
-            if i % 10 == 0:
+                r = future.result()
+                try:
+                    r["fingerprint"] = quick_fingerprint(Path(path_str))
+                except Exception:
+                    pass
+                with _cache_lock:
+                    _scan_cache[path_str] = r
+                with _progress_lock:
+                    _scan_progress.results.append(r)
+            except Exception as exc:
+                r = {"path": path_str, "name": Path(path_str).name, "status": "error",
+                     "reason": str(exc)[:200]}
+                with _progress_lock:
+                    _scan_progress.results.append(r)
+            if done_count % 10 == 0:
                 _save_cache()
-        except Exception as exc:
-            r = {"path": str(p), "name": p.name, "status": "error",
-                 "reason": str(exc)[:200]}
-            with _progress_lock:
-                _scan_progress.results.append(r)
 
     with _progress_lock:
         _scan_progress.running = False
