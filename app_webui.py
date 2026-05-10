@@ -468,7 +468,11 @@ def api_apply_one():
         ev["applied_renamed"] = renamed
         ev["applied_errors"] = errors
         with _cache_lock:
-            _scan_cache.pop(path_str, None)
+            _scan_cache[path_str] = {
+                **cached, **ev,
+                "status": "noop" if errors == 0 else cached.get("status", ""),
+                "operations": [],
+            }
         _save_cache()
         return ev
 
@@ -521,7 +525,11 @@ def api_apply_one():
     ev["applied_errors"] = errors
 
     with _cache_lock:
-        _scan_cache.pop(path_str, None)
+        _scan_cache[path_str] = {
+            **cached, **ev,
+            "status": "noop" if errors == 0 else ev.get("status", ""),
+            "operations": [],
+        }
     _save_cache()
     return ev
 
@@ -605,7 +613,11 @@ def api_apply_all():
             ev["applied_errors"] = errors
             results.append(ev)
             with _cache_lock:
-                _scan_cache.pop(path_str, None)
+                _scan_cache[path_str] = {
+                    **cached, **ev,
+                    "status": "noop" if errors == 0 else cached.get("status", ""),
+                    "operations": [],
+                }
             continue
 
         # Slow path: re-scan needed
@@ -662,7 +674,11 @@ def api_apply_all():
         ev["applied_errors"] = errors
         results.append(ev)
         with _cache_lock:
-            _scan_cache.pop(path_str, None)
+            _scan_cache[path_str] = {
+                **cached, **ev,
+                "status": "noop" if errors == 0 else ev.get("status", ""),
+                "operations": [],
+            }
 
     _save_cache()
     return {"total": len(results), "total_renamed": total_renamed,
