@@ -1404,15 +1404,22 @@ async function downloadAllNfo() {
   if (!confirm(`确定要为 ${candidates.length} 个已匹配文件夹下载 NFO 吗？`)) return;
   const btn = document.getElementById('btn-download-all-nfo');
   const orig = btn.textContent;
-  let ok=0, fail=0, i=0;
-  for (const item of candidates) {
-    btn.textContent = `⏳ NFO ${++i}/${candidates.length}`;
-    try {
-      const r = await fetch('/api/download-nfo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:item.path})});
-      const d = await r.json();
-      if (d.error) { showToast(`${item.name}: ${d.error}`, 'warning'); fail++; }
-      else ok++;
-    } catch(e) { showToast(`${item.name}: ${e.message}`, 'error'); fail++; }
+  let ok=0, fail=0;
+  const CONCURRENCY = 5;
+  for (let batch = 0; batch < candidates.length; batch += CONCURRENCY) {
+    const slice = candidates.slice(batch, batch + CONCURRENCY);
+    btn.textContent = `⏳ NFO ${Math.min(batch+CONCURRENCY, candidates.length)}/${candidates.length}`;
+    const results = await Promise.allSettled(slice.map(item =>
+      fetch('/api/download-nfo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:item.path})})
+        .then(r => r.json())
+        .then(d => ({item, d}))
+    ));
+    for (const r of results) {
+      if (r.status === 'fulfilled') {
+        if (r.value.d.error) { showToast(`${r.value.item.name}: ${r.value.d.error}`, 'warning'); fail++; }
+        else ok++;
+      } else { fail++; }
+    }
   }
   btn.textContent = orig;
   showToast(`📄 NFO 批量完成: ${ok} 成功, ${fail} 失败`, fail?'warning':'success');
@@ -1425,16 +1432,23 @@ async function downloadAllPosters() {
   if (!confirm(`确定要为 ${candidates.length} 个已匹配文件夹下载海报吗？`)) return;
   const btn = document.getElementById('btn-download-all-posters');
   const orig = btn.textContent;
-  let ok=0, fail=0, skip=0, i=0;
-  for (const item of candidates) {
-    btn.textContent = `⏳ 海报 ${++i}/${candidates.length}`;
-    try {
-      const r = await fetch('/api/download-poster', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:item.path})});
-      const d = await r.json();
-      if (d.error) { showToast(`${item.name}: ${d.error}`, 'warning'); fail++; }
-      else if (d.note === '已存在') skip++;
-      else ok++;
-    } catch(e) { showToast(`${item.name}: ${e.message}`, 'error'); fail++; }
+  let ok=0, fail=0, skip=0;
+  const CONCURRENCY = 5;
+  for (let batch = 0; batch < candidates.length; batch += CONCURRENCY) {
+    const slice = candidates.slice(batch, batch + CONCURRENCY);
+    btn.textContent = `⏳ 海报 ${Math.min(batch+CONCURRENCY, candidates.length)}/${candidates.length}`;
+    const results = await Promise.allSettled(slice.map(item =>
+      fetch('/api/download-poster', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:item.path})})
+        .then(r => r.json())
+        .then(d => ({item, d}))
+    ));
+    for (const r of results) {
+      if (r.status === 'fulfilled') {
+        if (r.value.d.error) { showToast(`${r.value.item.name}: ${r.value.d.error}`, 'warning'); fail++; }
+        else if (r.value.d.note === '已存在') skip++;
+        else ok++;
+      } else { fail++; }
+    }
   }
   btn.textContent = orig;
   showToast(`🖼️ 海报批量完成: ${ok} 下载, ${skip} 已有, ${fail} 失败`, fail?'warning':'success');
