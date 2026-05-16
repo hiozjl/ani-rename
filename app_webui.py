@@ -789,6 +789,61 @@ def api_download_poster():
             "count": len(saved)}
 
 
+@app.route("/api/emby-link", methods=["POST"])
+def api_emby_link():
+    """创建 Emby 兼容硬链接目录结构。"""
+    data = flask.request.get_json(silent=True) or {}
+    output = data.get("output", "").strip()
+    if not output:
+        return {"error": "请指定输出路径"}, 400
+
+    output_root = Path(output)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    with _cache_lock:
+        cache_snapshot = dict(_scan_cache) if _scan_cache else {}
+
+    if not cache_snapshot:
+        cache_file = MEDIA_ROOT / "webui_scan_cache.json"
+        if cache_file.exists():
+            try:
+                cache_snapshot = json.loads(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    from emby_link import process_entry
+
+    total_created = total_skipped = total_errors = 0
+    series_count = 0
+
+    cache_prefix_old = ""
+    cache_prefix_new = str(MEDIA_ROOT.parent).rstrip("/") + "/"
+
+    for _key, entry in cache_snapshot.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name", "").startswith("."):
+            continue
+        if entry.get("status") not in ("noop", "rename"):
+            continue
+        series_count += 1
+        c, s, e = process_entry(entry, output_root,
+                                cache_prefix_old, cache_prefix_new,
+                                dry_run=False)
+        total_created += c
+        total_skipped += s
+        total_errors += e
+
+    return {
+        "success": True,
+        "output": str(output_root),
+        "series_count": series_count,
+        "created": total_created,
+        "skipped": total_skipped,
+        "errors": total_errors,
+    }
+
+
 @app.route("/")
 def index():
     folders = _get_anime_folders()
@@ -876,6 +931,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-ap
     <button class="btn btn-success btn-sm" onclick="applyAll()">✅ 应用全部改名</button>
     <button class="btn btn-info btn-sm" onclick="downloadAllNfo()" id="btn-download-all-nfo">📄 下载全部 NFO</button>
     <button class="btn btn-outline-light btn-sm" onclick="downloadAllPosters()" id="btn-download-all-posters">🖼️ 下载全部海报</button>
+    <button class="btn btn-outline-warning btn-sm" onclick="embyLink()" id="btn-emby-link">🔗 导出 Emby 库</button>
     <button class="btn btn-outline-light btn-sm" onclick="refreshFolders()">🔄 刷新</button>
     <div class="ms-auto d-flex gap-2 align-items-center">
       <div class="search-box">
@@ -1383,6 +1439,24 @@ async function downloadAllPosters() {
   btn.textContent = orig;
   showToast(`🖼️ 海报批量完成: ${ok} 下载, ${skip} 已有, ${fail} 失败`, fail?'warning':'success');
   await refreshFolders();
+}
+
+async function embyLink() {
+  const output = prompt('请输入 Emby 库输出路径:', '/tank/Emby里番');
+  if (!output) return;
+  if (!confirm(`将在 ${output} 创建硬链接目录结构（Season 1/Season 2/Specials）。\n确认？`)) return;
+  const btn = document.getElementById('btn-emby-link');
+  const orig = btn.textContent;
+  btn.textContent = '⏳ 导出中...';
+  btn.disabled = true;
+  showToast('🔗 正在创建 Emby 硬链接...', 'info');
+  try {
+    const r = await fetch('/api/emby-link', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({output})});
+    const d = await r.json();
+    btn.textContent = orig; btn.disabled = false;
+    if (d.error) { showToast(d.error, 'error'); return; }
+    showToast(`🔗 导出完成: ${d.series_count} 系列, ${d.created} 新建, ${d.skipped} 跳过, ${d.errors} 错误`, d.errors?'warning':'success');
+  } catch(e) { btn.textContent = orig; btn.disabled = false; showToast('导出失败: '+e.message, 'error'); }
 }
 
 function filterCards() {
