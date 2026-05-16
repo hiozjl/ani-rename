@@ -776,8 +776,13 @@ def api_download_poster():
 
     # Check if poster already exists
     poster_path = p / "poster.jpg"
-    if poster_path.exists():
+    folder_path = p / "folder.jpg"
+    if poster_path.exists() and folder_path.exists():
         return {"success": True, "path": str(poster_path), "note": "已存在"}
+
+    if poster_path.exists() and not folder_path.exists():
+        folder_path.write_bytes(poster_path.read_bytes())
+        return {"success": True, "path": str(poster_path), "note": "已补建 folder.jpg (Emby兼容)"}
 
     saved = download_images(meta, p)
     return {"success": True, "saved": [str(s) for s in saved],

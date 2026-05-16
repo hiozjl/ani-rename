@@ -701,6 +701,11 @@ def download_images(meta: SeriesMetadata, target_dir: Path) -> list[Path]:
     poster_path = target_dir / "poster.jpg"
     if _download(meta.poster_url, poster_path):
         saved.append(poster_path)
+        # Emby uses folder.jpg as top-priority TV-series poster
+        folder_path = target_dir / "folder.jpg"
+        if not folder_path.exists():
+            folder_path.write_bytes(poster_path.read_bytes())
+            saved.append(folder_path)
 
     # Backdrops
     for i, url in enumerate(meta.backdrop_urls):
