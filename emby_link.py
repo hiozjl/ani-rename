@@ -21,6 +21,11 @@ from pathlib import Path
 
 MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".wmv", ".flv", ".webm"}
 
+META_EXTS = {".nfo", ".jpg", ".jpeg", ".png", ".srt", ".ass", ".ssa"}
+META_NAMES = {"tvshow.nfo", "poster.jpg", "folder.jpg", "fanart.jpg", "fanart2.jpg",
+              "fanart3.jpg", "fanart4.jpg", "fanart5.jpg", "logo.png", "cover.jpg",
+              "backdrop.jpg", "season.nfo"}
+
 
 def sanitize(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
@@ -65,15 +70,16 @@ def process_entry(entry: dict, output_root: Path, path_prefix_old: str, path_pre
     path_prefix_new: 实际文件系统的路径前缀 (如 /tank/里番/)
     """
     created = skipped = errors = 0
+    used_seasons = set()
 
     def remap(p: str) -> Path:
         if path_prefix_new:
             parts = Path(p).parts
             try:
                 idx = parts.index("里番")
-                relative = Path(*parts[idx:])
+                relative = Path(*parts[idx + 1:])
                 return Path(path_prefix_new.rstrip("/")) / relative
-            except ValueError:
+            except (ValueError, IndexError):
                 pass
             if path_prefix_old and p.startswith(path_prefix_old):
                 return Path(path_prefix_new + p[len(path_prefix_old):])
@@ -116,6 +122,7 @@ def process_entry(entry: dict, output_root: Path, path_prefix_old: str, path_pre
 
             s, e = se
             sdir = season_dir_name(s)
+            used_seasons.add(sdir)
             dst = output_root / series_title / sdir / src_name
 
             if dry_run:
@@ -155,6 +162,7 @@ def process_entry(entry: dict, output_root: Path, path_prefix_old: str, path_pre
                         continue
 
                 sdir = season_dir_name(s)
+                used_seasons.add(sdir)
 
                 videos = sorted(
                     [f for f in sub.iterdir()
@@ -207,7 +215,69 @@ def process_entry(entry: dict, output_root: Path, path_prefix_old: str, path_pre
                     else:
                         errors += 1
 
+    series_out = output_root / series_title
+    meta_created = link_meta_files(src_dir, series_out, used_seasons, dry_run)
+    created += meta_created
+
     return created, skipped, errors
+
+
+def link_meta_files(src_dir: Path, series_out: Path, used_seasons: set[str],
+                    dry_run: bool):
+    """Link NFO, poster, fanart and other metadata to Emby output.
+
+    src_dir: source series directory
+    series_out: output series root (e.g. /tank/Emby里番/鬼父)
+    used_seasons: set of dir names like {"Season 1", "Season 2", "Specials"}
+    """
+    created = 0
+
+    def try_link(src: Path, dst: Path):
+        nonlocal created
+        if dry_run:
+            print(f"  → {dst.relative_to(series_out.parent)}")
+            created += 1
+        else:
+            result = link_file(src, dst)
+            if result is True:
+                created += 1
+
+    # Series root metadata → output series root
+    for f in sorted(src_dir.iterdir()):
+        if not f.is_file():
+            continue
+        name = f.name.lower()
+        if name in META_NAMES or (f.suffix.lower() in META_EXTS and
+                                   any(name.startswith(p) for p in ("tvshow", "poster", "folder", "fanart", "logo", "cover", "backdrop", "season-specials"))):
+            try_link(f, series_out / f.name)
+
+    # Season/episode metadata → output season dirs
+    season_pat = re.compile(r"^(?:S(?:eason\s*)?)?(\d{1,2})$", re.IGNORECASE)
+    ep_subdir_pat = re.compile(r"^(\d{1,3})(?:[\s._-]+.*)?$")
+
+    for sub in sorted(src_dir.iterdir()):
+        if not sub.is_dir() or sub.name.startswith("."):
+            continue
+
+        s = 1
+        sm = season_pat.match(sub.name)
+        if sm:
+            s = int(sm.group(1))
+        else:
+            em = ep_subdir_pat.match(sub.name)
+            if not em:
+                continue
+        sdir = season_dir_name(s)
+        out_season = series_out / sdir
+
+        # All metadata files in this subdir
+        for f in sorted(sub.iterdir()):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() in META_EXTS:
+                try_link(f, out_season / f.name)
+
+    return created
 
 
 def main():
