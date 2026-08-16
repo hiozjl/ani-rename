@@ -34,6 +34,9 @@ from scanner import (
     guess_structure,
     scan_series,
     title_variants,
+    series_content_identity,
+    stable_entry_name_hash,
+    dedupe_series_folders,
 )
 from text_utils import (
     to_romaji,
@@ -105,6 +108,8 @@ def render_csv(scans: list[SeriesScan], path: Path, extra_items: list[dict[str, 
             ])
         for item in (extra_items or []):
             top = item.get("top_candidate") or {}
+            if not top and item.get("candidates"):
+                top = item["candidates"][0] or {}
             fp = item.get("fingerprint") or {}
             writer.writerow([
                 item.get("path", ""), item.get("structure", ""), item.get("title_hint", ""),
@@ -120,6 +125,7 @@ def manifest_item(scan: SeriesScan) -> dict[str, Any]:
     data = asdict(scan)
     top = scan.candidates[0] if scan.candidates else None
     data["top_candidate_band"] = confidence_band(top.score) if top else ""
+    data["content_identity"] = (scan.fingerprint or {}).get("content_identity", "")
     data["recommended_action"] = (
         "review"
         if (scan.reason_flags or not top or confidence_band(top.score) != "high")
@@ -131,7 +137,20 @@ def manifest_item(scan: SeriesScan) -> dict[str, Any]:
 def series_paths(root: Path, explicit_paths: list[str]) -> list[Path]:
     if explicit_paths:
         return [Path(p) for p in explicit_paths]
-    return sorted([p for p in root.iterdir() if p.is_dir() and p.name not in JUNK_DIR_NAMES])
+    paths = sorted([p for p in root.iterdir() if p.is_dir() and p.name not in JUNK_DIR_NAMES])
+    return dedupe_series_folders(paths, prefer_nfo=True)
+
+
+def item_content_identity(item: dict[str, Any]) -> str:
+    fp = item.get("fingerprint") or {}
+    if not isinstance(fp, dict):
+        fp = {}
+    return item.get("content_identity") or fp.get("content_identity") or ""
+
+
+def item_has_content_identity(item: dict[str, Any]) -> bool:
+    fp = item.get("fingerprint") or {}
+    return "content_identity" in item or (isinstance(fp, dict) and "content_identity" in fp)
 
 
 def load_previous_manifest(json_path: Path) -> dict[str, dict[str, Any]]:
@@ -146,6 +165,12 @@ def load_previous_manifest(json_path: Path) -> dict[str, dict[str, Any]]:
             folder_name = Path(path_str).name
             if folder_name and folder_name not in result:
                 result[f"__name__{folder_name}"] = item
+            content_id = item_content_identity(item)
+            if content_id:
+                identity_key = f"__identity__{content_id}"
+                existing = result.get(identity_key)
+                if existing is None or (not existing.get("candidates") and item.get("candidates")):
+                    result[identity_key] = item
         return result
     except Exception:
         return {}
@@ -161,46 +186,138 @@ def quick_fingerprint(path: Path) -> dict[str, Any]:
     child_dirs = [p for p in entries if p.is_dir()]
     child_media = [p for p in entries if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
     episode_count = 0
+    media_file_count = 0
+    episode_numbers: list[int] = []
     if structure == "episode_subdirs":
-        episode_count = sum(1 for d in child_dirs if EPISODE_DIR_RE.match(d.name))
+        for d in sorted(child_dirs, key=lambda p: p.name):
+            m = EPISODE_DIR_RE.match(d.name)
+            if not m:
+                continue
+            episode_count += 1
+            episode_numbers.append(int(m.group(1)))
+            try:
+                media_file_count += len([f for f in d.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTS])
+            except OSError:
+                pass
     elif structure == "season_dirs":
-        for sd in child_dirs:
-            if SEASON_DIR_RE.match(sd.name):
-                try:
-                    episode_count += len([f for f in sd.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTS])
-                except OSError:
-                    pass
+        season_dirs = [d for d in child_dirs if SEASON_DIR_RE.match(d.name)]
+        for sd in sorted(season_dirs, key=lambda p: int(SEASON_DIR_RE.match(p.name).group(1))):
+            try:
+                season_media = [f for f in sd.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTS]
+            except OSError:
+                continue
+            video_count = len([f for f in season_media if f.suffix.lower() not in {".srt", ".ass", ".ssa", ".sub"}])
+            episode_count += video_count
+            media_file_count += len(season_media)
+            episode_numbers.extend(range(len(episode_numbers) + 1, len(episode_numbers) + video_count + 1))
     elif structure == "flat":
         episode_count = len([f for f in child_media if f.suffix.lower() not in {".srt", ".ass", ".ssa", ".sub"}])
+        media_file_count = len(child_media)
+        episode_numbers = list(range(1, episode_count + 1))
     try:
         newest_mtime = max(p.stat().st_mtime for p in entries)
-    except OSError:
+    except (OSError, ValueError):
         newest_mtime = 0.0
-    # hash of all file/subdir names to detect renames
-    all_names = sorted(p.name for p in entries)
-    name_hash = hash(tuple(all_names))
+    # Stable digest of all file/subdir names to detect renames.  The built-in
+    # hash() is randomized per process and must not be persisted across runs.
     return {
         "structure": structure,
         "entry_count": entry_count,
         "episode_count": episode_count,
+        "episode_numbers": episode_numbers,
+        "media_file_count": media_file_count,
         "newest_mtime": newest_mtime,
-        "name_hash": name_hash,
+        "name_hash": stable_entry_name_hash(path),
+        "content_identity": series_content_identity(path),
     }
 
 
+def apply_previous_candidate(scan: SeriesScan, prev_item: dict[str, Any]) -> None:
+    """Reuse the previous manifest/cache match so a rescan keeps the name.
+
+    This is what keeps a previously renamed series stable: even when the
+    folder or file names changed, the stored metadata identity is injected as
+    a high-confidence candidate before new searches run.
+    """
+    if scan.candidates:
+        return
+    top = prev_item.get("top_candidate")
+    if not isinstance(top, dict) or not top.get("name"):
+        candidates = prev_item.get("candidates") or []
+        top = candidates[0] if candidates else None
+    if not isinstance(top, dict) or not top.get("name"):
+        return
+
+    source = top.get("source") or "tmdb"
+    source_id = str(top.get("source_id") or "")
+    tmdb_id = top.get("tmdb_id") or 0
+    if not source_id and tmdb_id:
+        source_id = str(tmdb_id)
+
+    known = Candidate(
+        tmdb_id=int(tmdb_id) if source == "tmdb" and str(tmdb_id).lstrip("-").isdigit() else 0,
+        name=top.get("name", ""),
+        original_name=top.get("original_name", ""),
+        first_air_date=top.get("first_air_date", ""),
+        original_language=top.get("original_language", ""),
+        overview=top.get("overview", ""),
+        score=0.99,
+        reasons=list(top.get("reasons") or []) + ["reused_previous_match"],
+        season_fit=top.get("season_fit"),
+        source=source,
+        source_id=source_id,
+        zh_title=top.get("zh_title", ""),
+        raw_data=top.get("raw_data"),
+    )
+    scan.candidates = [known]
+
+
 def fingerprint_changed(prev_item: dict[str, Any], current_fp: dict[str, Any]) -> bool:
-    prev_fp = prev_item.get("fingerprint", {})
+    prev_fp = prev_item.get("fingerprint", {}) or {}
     if not prev_fp:
         return True
-    for key in ("structure", "entry_count", "episode_count"):
-        if prev_fp.get(key) != current_fp.get(key):
-            return True
-    prev_eps = prev_fp.get("episode_numbers", [])
-    cur_eps = current_fp.get("episode_numbers", [])
-    if prev_eps != cur_eps:
+    if not current_fp:
         return True
-    # detect file renames (same count but different names)
-    if prev_fp.get("name_hash") != current_fp.get("name_hash"):
+
+    # Structural keys live in the fingerprint in new manifests, and at the
+    # item top level in old manifests.  ``media_file_count`` is intentionally
+    # not compared here because subtitle-to-video association can legitimately
+    # vary between the quick and full parsers.
+    for key in ("structure", "entry_count", "episode_count"):
+        prev_value = prev_fp.get(key, prev_item.get(key))
+        if prev_value is None or key not in current_fp:
+            continue
+        if prev_value != current_fp[key]:
+            return True
+
+    if "episode_numbers" in current_fp:
+        prev_eps = prev_fp.get("episode_numbers") or prev_item.get("episode_numbers") or []
+        cur_eps = current_fp.get("episode_numbers") or []
+        if prev_eps != cur_eps:
+            return True
+
+    # Content identity is stable across renames; compare it when both sides
+    # declare one (including the empty string, which means "no videos").
+    prev_has_cid = "content_identity" in prev_fp or "content_identity" in prev_item
+    cur_has_cid = "content_identity" in current_fp
+    if prev_has_cid and cur_has_cid:
+        prev_cid = prev_fp.get("content_identity") or prev_item.get("content_identity") or ""
+        cur_cid = current_fp.get("content_identity") or ""
+        if prev_cid != cur_cid:
+            return True
+
+    # Detect file renames via the deterministic name digest.  New manifests
+    # use a 64-hex SHA-256 digest.  Older manifests contain Python's
+    # randomized hash() value, which cannot be trusted across processes; force
+    # one rescan in that mixed case, after which the new stable digest is
+    # persisted.
+    prev_name_hash = prev_fp.get("name_hash")
+    cur_name_hash = current_fp.get("name_hash")
+    prev_is_sha = isinstance(prev_name_hash, str) and len(prev_name_hash) == 64
+    cur_is_sha = isinstance(cur_name_hash, str) and len(cur_name_hash) == 64
+    if prev_is_sha and cur_is_sha:
+        return prev_name_hash != cur_name_hash
+    if prev_name_hash is not None or cur_name_hash is not None:
         return True
     return False
 
@@ -243,10 +360,27 @@ def main() -> int:
 
     all_paths = series_paths(root, args.path)
     scan_paths: list[Path] = []
+    prev_by_path: dict[str, dict[str, Any]] = {}
     for p in all_paths:
         p_str = str(p.resolve())
         name_key = f"__name__{p.name}"
-        prev_item = prev_manifest.get(p_str) or prev_manifest.get(name_key)
+        try:
+            identity = series_content_identity(p)
+        except OSError:
+            identity = ""
+
+        path_prev = prev_manifest.get(p_str)
+        if path_prev and item_has_content_identity(path_prev):
+            if item_content_identity(path_prev) != identity:
+                path_prev = None
+        name_prev = prev_manifest.get(name_key)
+        if name_prev and item_has_content_identity(name_prev):
+            if item_content_identity(name_prev) != identity:
+                name_prev = None
+        prev_item = path_prev or name_prev
+        if not prev_item and identity:
+            prev_item = prev_manifest.get(f"__identity__{identity}")
+        prev_by_path[p_str] = prev_item or {}
 
         if not args.force_rescan:
             if args.skip_matched and (p / "tvshow.nfo").exists():
@@ -263,7 +397,7 @@ def main() -> int:
                 })
                 continue
 
-            if prev_item:
+            if prev_item and prev_item.get("path") == p_str:
                 prev_band = prev_item.get("top_candidate_band", "")
                 prev_candidates = prev_item.get("candidates") or []
                 if args.skip_matched and prev_candidates:
@@ -281,7 +415,13 @@ def main() -> int:
 
     if reused_items:
         print(f"Skipping {len(reused_items)} unchanged/matched items, scanning {len(scan_paths)}")
-    scans = [scan_series(path.resolve()) for path in scan_paths]
+    scans: list[SeriesScan] = []
+    for path in scan_paths:
+        scan = scan_series(path.resolve())
+        prev_item = prev_by_path.get(str(path.resolve()), {})
+        if prev_item:
+            apply_previous_candidate(scan, prev_item)
+        scans.append(scan)
 
     anidb_username = args.anidb_username.strip()
     anidb_password = args.anidb_password.strip()

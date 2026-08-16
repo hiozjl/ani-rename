@@ -19,7 +19,12 @@ import re
 import sys
 from pathlib import Path
 
-MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".wmv", ".flv", ".webm"}
+from scanner import series_content_identity
+
+MEDIA_EXTS = {
+    ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".m2ts",
+    ".mov", ".mpg", ".mpeg", ".wmv", ".flv", ".webm",
+}
 
 META_EXTS = {".nfo", ".jpg", ".jpeg", ".png", ".srt", ".ass", ".ssa"}
 META_NAMES = {"tvshow.nfo", "poster.jpg", "folder.jpg", "fanart.jpg", "fanart2.jpg",
@@ -63,11 +68,16 @@ def link_file(src: Path, dst: Path) -> bool:
             return False
 
 
-def process_entry(entry: dict, output_root: Path, path_prefix_old: str, path_prefix_new: str, dry_run: bool):
+def process_entry(entry: dict, output_root: Path, path_prefix_old: str,
+                  path_prefix_new: str, dry_run: bool,
+                  seen_content_ids: set[str] | None = None):
     """处理单个系列条目，返回 (created, skipped, errors) 计数。
 
     path_prefix_old: 缓存中的路径前缀 (如 /mnt/media/里番/)
     path_prefix_new: 实际文件系统的路径前缀 (如 /tank/里番/)
+    seen_content_ids: 可选的去重集合。传入后，内容指纹相同的硬链接
+        重复文件夹只会处理第一个，避免在 Emby 输出目录中生成多个内容
+        相同、仅名字不同的系列目录。
     """
     created = skipped = errors = 0
     used_seasons = set()
@@ -102,6 +112,22 @@ def process_entry(entry: dict, output_root: Path, path_prefix_old: str, path_pre
     src_dir = remap(source_path)
     if not src_dir.is_dir():
         return 0, 0, 0
+
+    if seen_content_ids is not None:
+        fp = entry.get("fingerprint") or {}
+        if not isinstance(fp, dict):
+            fp = {}
+        try:
+            current_content_id = series_content_identity(src_dir)
+        except OSError:
+            current_content_id = ""
+        # Prefer a fresh filesystem fingerprint when available; fall back to
+        # the persisted cache identity for legacy entries.
+        content_id = current_content_id or entry.get("content_identity") or fp.get("content_identity") or ""
+        if content_id:
+            if content_id in seen_content_ids:
+                return 0, 0, 0
+            seen_content_ids.add(content_id)
 
     if operations:
         for op in operations:
@@ -308,23 +334,40 @@ def main():
 
     total_created = total_skipped = total_errors = 0
     series_count = 0
+    seen_content_ids: set[str] = set()
 
+    eligible_entries = []
     for key, entry in cache.items():
         if not isinstance(entry, dict):
             continue
         status = entry.get("status", "")
         if status not in ("noop", "rename"):
             continue
+        eligible_entries.append(entry)
+    # Process entries with an existing metadata match first.  If several
+    # cache entries are hard-link duplicates, the matched/original one wins.
+    def entry_rank(entry: dict):
+        source_path = entry.get("path") or ""
+        try:
+            has_nfo = (Path(source_path) / "tvshow.nfo").exists()
+        except OSError:
+            has_nfo = False
+        return (not entry.get("top_candidate"), not has_nfo, source_path.lower())
 
-        series_count += 1
+    eligible_entries.sort(key=entry_rank)
+
+    for entry in eligible_entries:
         series_title = sanitize(entry.get("series_title") or entry.get("name", "?"))
 
         if args.dry_run:
             print(f"\n📁 {series_title}")
 
+        seen_before = len(seen_content_ids)
         c, s, e = process_entry(entry, output_root,
                                 args.cache_prefix, args.actual_prefix,
-                                args.dry_run)
+                                args.dry_run, seen_content_ids)
+        if len(seen_content_ids) > seen_before:
+            series_count += 1
         total_created += c
         total_skipped += s
         total_errors += e

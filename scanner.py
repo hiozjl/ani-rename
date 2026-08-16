@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,7 +19,13 @@ from text_utils import (
     JUNK_PATTERNS,
 )
 
-MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".srt", ".ass", ".ssa", ".sub"}
+MEDIA_EXTS = {
+    ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".m2ts",
+    ".mov", ".mpg", ".mpeg", ".wmv", ".flv", ".webm",
+    ".srt", ".ass", ".ssa", ".sub",
+}
+SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".sub"}
+VIDEO_EXTS = MEDIA_EXTS - SUBTITLE_EXTS
 EPISODE_DIR_RE = re.compile(r"^(\d{1,3})(?:[\s._-]+(.*))?$")
 SEASON_DIR_RE = re.compile(r"^(?:season\s*|s)(\d{1,2})$", re.IGNORECASE)
 
@@ -119,14 +127,39 @@ def title_variants(folder_name: str) -> list[str]:
     return variants
 
 
+def tvshow_nfo_titles(path: Path) -> list[str]:
+    """Return series titles persisted in ``tvshow.nfo``, if any.
+
+    These are used before other search variants so a folder that was renamed
+    after a previous metadata match keeps resolving to the same series.
+    """
+    nfo = path / "tvshow.nfo"
+    if not nfo.is_file():
+        return []
+    try:
+        root = ET.parse(str(nfo)).getroot()
+    except Exception:
+        return []
+    titles: list[str] = []
+    for field in ("originaltitle", "title"):
+        value = (root.findtext(field) or "").strip()
+        if value and value not in titles:
+            titles.append(value)
+    return titles
+
+
 def infer_series_aliases_from_media(media_names: list[str], episode_index: int, title_hint: str) -> list[str]:
     aliases: list[str] = []
     for media in media_names:
         stem = Path(media).stem
         token_match = extract_episode_token(stem)
-        candidate = stem
-        if token_match:
-            candidate = stem[: token_match.start()]
+        # Only trust filenames that contain an explicit SxxExx token.  After a
+        # previous rename these files have the canonical form
+        # "Series - S01E01 - Title.mkv", and the part before SxxExx is the
+        # series name that was used before.
+        if not token_match:
+            continue
+        candidate = stem[: token_match.start()]
         candidate = clean_text(candidate)
         candidate = re.sub(r"第\s*\d+\s*[話话卷集].*$", "", candidate).strip()
         candidate = re.sub(r"[#＃]\s*\d+.*$", "", candidate).strip()
@@ -150,6 +183,116 @@ def guess_structure(path: Path) -> str:
 
 def list_media_files(path: Path) -> list[str]:
     return sorted([p.name for p in path.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS])
+
+
+def stable_entry_name_hash(path: Path) -> str:
+    """Deterministic hash of descendant names, used to detect file renames.
+
+    Python's built-in ``hash()`` is randomized per process, so it is not
+    suitable for fingerprints that are persisted between runs.  Relative
+    paths are used so renaming the series folder itself does not change the
+    digest, while renaming files inside any episode/season subdirectory does.
+    """
+    try:
+        names = sorted(str(p.relative_to(path)) for p in path.rglob("*"))
+    except OSError:
+        return ""
+    payload = "\n".join(names).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def media_identity_key(path: Path) -> str:
+    """Return a stable identity for one media file.
+
+    ``(st_dev, st_ino, st_size, st_mtime_ns)`` is unchanged by renaming the
+    file or the parent directory.  Hard links to the same content therefore
+    share a key, while an in-place content modification produces a new key.
+    """
+    st = path.stat()
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+
+def series_content_identity(path: Path) -> str:
+    """Return a stable, content-based identity for a series folder.
+
+    The identity is built from the sorted multiset of video-file
+    ``(device, inode, size, mtime)`` tuples below ``path``.  Subtitles are
+    intentionally ignored so adding/removing a subtitle does not invalidate a
+    previous metadata match.  Renaming files/folders does not change the
+    identity, and two folders made of hard links to the same videos produce
+    the same value.  Returns ``""`` when no videos can be inspected.
+    """
+    keys: list[str] = []
+    try:
+        entries = list(path.rglob("*"))
+    except OSError:
+        return ""
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
+                keys.append(media_identity_key(entry))
+        except OSError:
+            continue
+    if not keys:
+        return ""
+    payload = "\0".join(sorted(keys)).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def dedupe_series_folders(paths: list[Path], prefer_nfo: bool = False) -> list[Path]:
+    """Remove folders that are hard-link duplicates of an earlier folder.
+
+    Only folders with a usable video-content identity are deduplicated;
+    folders whose content cannot be fingerprinted are kept untouched.  When
+    ``prefer_nfo`` is true, the representative of each duplicate group prefers
+    ``tvshow.nfo`` and the project's native episode-subdirectory layout over
+    an Emby-style ``Season N`` export.
+    """
+    identities: dict[Path, str] = {}
+    groups: dict[str, list[Path]] = {}
+    for path in paths:
+        try:
+            identity = series_content_identity(path)
+        except OSError:
+            identity = ""
+        identities[path] = identity
+        if identity:
+            groups.setdefault(identity, []).append(path)
+
+    if not prefer_nfo:
+        seen: set[str] = set()
+        result: list[Path] = []
+        for path in paths:
+            identity = identities[path]
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            result.append(path)
+        return result
+
+    selected: set[Path] = {path for path, identity in identities.items() if not identity}
+
+    def representative_rank(path: Path) -> tuple[int, int, str]:
+        try:
+            has_nfo = (path / "tvshow.nfo").is_file()
+            structure = guess_structure(path)
+        except OSError:
+            return (1, 3, path.name.lower())
+        structure_rank = {
+            "episode_subdirs": 0,
+            "flat": 1,
+            "season_dirs": 2,
+        }.get(structure, 3)
+        return (0 if has_nfo else 1, structure_rank, path.name.lower())
+
+    for group in groups.values():
+        if len(group) == 1:
+            selected.add(group[0])
+            continue
+        representative = min(group, key=representative_rank)
+        selected.add(representative)
+    return [path for path in paths if path in selected]
 
 
 def parse_episode_subdirs(path: Path, series_title: str) -> list[EpisodeItem]:
@@ -234,13 +377,26 @@ def parse_flat_media(path: Path, series_title: str) -> list[EpisodeItem]:
     return episodes
 
 
-def fingerprint(path: Path, episodes: list[EpisodeItem]) -> dict[str, Any]:
+def fingerprint(path: Path, episodes: list[EpisodeItem], structure: str = "") -> dict[str, Any]:
+    try:
+        entry_count = len(list(path.iterdir()))
+    except OSError:
+        entry_count = 0
+    if not structure:
+        try:
+            structure = guess_structure(path)
+        except OSError:
+            structure = ""
     return {
         "path": str(path),
-        "entry_count": len(list(path.iterdir())),
+        "structure": structure,
+        "entry_count": entry_count,
+        "episode_count": len(episodes),
         "episode_dirs": [ep.episode_dir for ep in episodes],
         "episode_numbers": [ep.index for ep in episodes],
         "media_file_count": sum(len(ep.media_files) for ep in episodes),
+        "name_hash": stable_entry_name_hash(path),
+        "content_identity": series_content_identity(path),
     }
 
 
@@ -329,10 +485,22 @@ def scan_series(path: Path) -> SeriesScan:
     media_aliases: list[str] = []
     for ep in episodes[:3]:
         media_aliases.extend(infer_series_aliases_from_media(ep.media_files, ep.index, title_hint))
-    for alias in media_aliases:
+    # Prefer names recovered from already-canonical media files.  The folder
+    # may still have its pre-rename name, but the file prefix is the title
+    # that was actually applied previously.
+    existing_lower = {q.lower() for q in queries}
+    for alias in reversed(media_aliases):
         alias = alias.strip()
-        if alias and alias not in queries:
-            queries.append(alias)
+        if alias and alias.lower() not in existing_lower:
+            queries.insert(0, alias)
+            existing_lower.add(alias.lower())
+
+    # A previously downloaded tvshow.nfo is the strongest local hint about
+    # which metadata title was selected before.
+    for nfo_title in reversed(tvshow_nfo_titles(path)):
+        if nfo_title and nfo_title.lower() not in existing_lower:
+            queries.insert(0, nfo_title)
+            existing_lower.add(nfo_title.lower())
 
     # Truncate excessive search variants — more than 8 rarely helps
     seen = set()
@@ -349,7 +517,7 @@ def scan_series(path: Path) -> SeriesScan:
         structure=structure,
         title_hint=title_hint,
         query_variants=queries,
-        fingerprint=fingerprint(path, episodes),
+        fingerprint=fingerprint(path, episodes, structure),
         episode_count=len(episodes),
         episodes=episodes,
         confidence=confidence,

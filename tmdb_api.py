@@ -112,7 +112,7 @@ def score_candidate(scan: SeriesScan, result: dict[str, Any], season_data: dict[
 
 
 def enrich_with_tmdb(scan: SeriesScan, api_key: str, language: str) -> None:
-    candidates: dict[int, Candidate] = {}
+    candidates: dict[tuple[str, str], Candidate] = {}
     for query in scan.query_variants:
         if not query:
             continue
@@ -128,4 +128,12 @@ def enrich_with_tmdb(scan: SeriesScan, api_key: str, language: str) -> None:
             current = candidates.get(key)
             if current is None or candidate.score > current.score:
                 candidates[key] = candidate
-    scan.candidates = sorted(candidates.values(), key=lambda item: item.score, reverse=True)[:5]
+    # Merge rather than replace: callers may have injected a previously
+    # matched high-confidence candidate before enrichment, and that match
+    # must survive the TMDB search (otherwise a rescan can flip names).
+    merged = {(candidate.source, candidate.source_id): candidate for candidate in scan.candidates}
+    for key, candidate in candidates.items():
+        current = merged.get(key)
+        if current is None or candidate.score > current.score:
+            merged[key] = candidate
+    scan.candidates = sorted(merged.values(), key=lambda item: item.score, reverse=True)[:5]

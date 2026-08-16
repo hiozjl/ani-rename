@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 
-MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".srt", ".ass", ".ssa", ".sub"}
+MEDIA_EXTS = {
+    ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".m2ts",
+    ".mov", ".mpg", ".mpeg", ".wmv", ".flv", ".webm",
+    ".srt", ".ass", ".ssa", ".sub",
+}
 
 
 def load_manifest(path: Path) -> dict[str, Any]:

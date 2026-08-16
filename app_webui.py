@@ -27,6 +27,7 @@ from tmdb_scan_preview import (
     tmdb_series_details,
 )
 from enrich import enrich_all_sources
+from scanner import dedupe_series_folders, series_content_identity
 from tmdb_rename import (
     apply_operations,
     download_and_write_nfo,
@@ -72,6 +73,106 @@ def _media_path(path_str: str) -> Path | None:
     except (OSError, RuntimeError, ValueError):
         return None
     return None
+
+
+def _content_identity(path: Path) -> str:
+    try:
+        return series_content_identity(path)
+    except OSError:
+        return ""
+
+
+def _entry_content_identity(entry: dict) -> str:
+    fp = entry.get("fingerprint") or {}
+    if not isinstance(fp, dict):
+        fp = {}
+    return entry.get("content_identity") or fp.get("content_identity") or ""
+
+
+def _entry_has_content_identity(entry: dict) -> bool:
+    fp = entry.get("fingerprint") or {}
+    return "content_identity" in entry or (isinstance(fp, dict) and "content_identity" in fp)
+
+
+def _get_cached_entry(path: Path) -> dict:
+    """Find a cached scan by path first, then by stable content identity.
+
+    Content-identity lookup is what lets a folder renamed outside the WebUI
+    still reuse its previous metadata match instead of matching a different
+    series name on the next scan.
+    """
+    path_str = str(path)
+    identity = _content_identity(path)
+    with _cache_lock:
+        legacy_exact: dict | None = None
+        exact = _scan_cache.get(path_str)
+        if isinstance(exact, dict) and exact:
+            exact_has_identity = _entry_has_content_identity(exact)
+            exact_identity = _entry_content_identity(exact)
+            if exact_has_identity and exact_identity == identity:
+                return dict(exact)
+            if not exact_has_identity:
+                # Pre-upgrade cache entry; keep it as a fallback in case no
+                # content-identity match is found below.
+                legacy_exact = dict(exact)
+            # If the exact-path entry has a different identity, the path has
+            # been reused for different content; do not use it.
+        if identity:
+            best: dict | None = None
+            for entry in _scan_cache.values():
+                if not isinstance(entry, dict):
+                    continue
+                if _entry_content_identity(entry) != identity:
+                    continue
+                copy = dict(entry)
+                # Entry was stored under another path (folder was renamed
+                # externally).  Old operations still reference the old
+                # path, so clear them and let the caller rebuild a preview.
+                if copy.get("path") != path_str:
+                    copy["operations"] = []
+                if best is None or (not best.get("top_candidate") and copy.get("top_candidate")):
+                    best = copy
+            if legacy_exact is not None and legacy_exact.get("top_candidate") and not (best or {}).get("top_candidate"):
+                return legacy_exact
+            if best is not None:
+                return best
+        if legacy_exact is not None:
+            return legacy_exact
+    return {}
+
+
+def _inject_cached_candidate(scan, cached: dict) -> bool:
+    """Inject a previous metadata match as a high-confidence candidate."""
+    if scan.candidates:
+        return False
+    prev_cand = cached.get("top_candidate")
+    if not isinstance(prev_cand, dict) or not prev_cand.get("name"):
+        return False
+
+    source = prev_cand.get("source") or "tmdb"
+    source_id = str(prev_cand.get("source_id") or "")
+    tmdb_id = prev_cand.get("tmdb_id") or 0
+    if not source_id and tmdb_id:
+        source_id = str(tmdb_id)
+
+    from tmdb_scan_preview import Candidate
+    known = Candidate(
+        tmdb_id=int(tmdb_id) if source == "tmdb" and str(tmdb_id).lstrip("-").isdigit() else 0,
+        name=prev_cand.get("name", ""),
+        original_name=prev_cand.get("original_name", ""),
+        first_air_date=prev_cand.get("first_air_date", ""),
+        original_language=prev_cand.get("original_language", ""),
+        overview=prev_cand.get("overview", ""),
+        score=0.99,
+        reasons=list(prev_cand.get("reasons") or []) + ["reused_previous_match"],
+        season_fit=prev_cand.get("season_fit"),
+        source=source,
+        source_id=source_id,
+        zh_title=prev_cand.get("zh_title", ""),
+        raw_data=prev_cand.get("raw_data"),
+    )
+    scan.candidates = [known]
+    return True
 
 
 # ── background scanner ─────────────────────────────────────────────────────
@@ -122,12 +223,16 @@ def _get_anime_folders() -> list[Path]:
     skip = {"__pycache__", "anidb-title-cache", ".codex", ".omx",
             ".tmdb-apply-test", ".tmdb-cli-test", ".claude", ".superpowers"}
     try:
-        return sorted(
+        folders = sorted(
             [p for p in MEDIA_ROOT.iterdir() if p.is_dir() and p.name not in skip],
             key=lambda p: p.name,
         )
     except OSError:
         return []
+    # Hard-linked folders contain the same media inodes and only differ by
+    # name.  Scanning every one would produce duplicate cards and can match
+    # the same content to different series names.
+    return dedupe_series_folders(folders, prefer_nfo=True)
 
 
 def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> dict:
@@ -142,50 +247,11 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
         scan.query_variants = [override_title] + scan.query_variants
         scan.title_hint = override_title
 
-    # 尝试用缓存的 ID 直接匹配（不管文件夹改了什么名字都能对上）
-    with _cache_lock:
-        prev = _scan_cache.get(str(p), {})
-    prev_cand = prev.get("top_candidate")
-    if prev_cand and prev_cand.get("source_id"):
-        from tmdb_scan_preview import Candidate
-        src = prev_cand.get("source", "")
-        sid = prev_cand.get("source_id", "")
-        tmdb_id = prev_cand.get("tmdb_id", 0)
-        name = prev_cand.get("name", "")
-        zh = prev_cand.get("zh_title", "")
-        # try direct ID lookup
-        direct_name = name
-        api_key = _api_key()
-        if src == "tmdb" and tmdb_id:
-            try:
-                details = tmdb_series_details(int(tmdb_id), api_key, "ja-JP")
-                if details:
-                    direct_name = details.get("name") or name
-            except Exception:
-                pass
-        elif src == "bangumi":
-            try:
-                detail = bangumi_subject_details(int(sid))
-                if detail:
-                    direct_name = detail.get("name_cn") or detail.get("name") or name
-            except Exception:
-                pass
-        # inject a high-confidence candidate
-        known = Candidate(
-            tmdb_id=tmdb_id if src == "tmdb" else 0,
-            name=direct_name,
-            original_name=prev_cand.get("original_name", ""),
-            first_air_date=prev_cand.get("first_air_date", ""),
-            original_language=prev_cand.get("original_language", ""),
-            overview=prev_cand.get("overview", ""),
-            score=0.99,
-            reasons=["reused_previous_match"],
-            source=src,
-            source_id=sid,
-            zh_title=zh,
-            raw_data=prev_cand.get("raw_data"),
-        )
-        scan.candidates = [known]
+    # 尝试用缓存的 ID 直接匹配（不管文件夹/文件改了什么名字都能对上）。
+    # 优先使用持久化的名称而不是重新请求 API，避免每次扫描因语言/来源
+    # 排序变化而匹配到不同的名字。
+    prev = _get_cached_entry(p)
+    _inject_cached_candidate(scan, prev)
 
     # 如果没找到缓存 ID，尝试从 tvshow.nfo / poster.jpg 判断是否有过匹配
     if not scan.candidates:
@@ -215,7 +281,7 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
     if override_title and (not ev.get("top_candidate") or (ev["top_candidate"].get("score", 0) or 0) < 0.7):
         ev["series_title"] = override_title
 
-    return {
+    result = {
         "path": str(scan.path),
         "name": scan.title_hint,
         "structure": scan.structure,
@@ -226,6 +292,12 @@ def _scan_one_impl(p: Path, enrich: bool = True, override_title: str = "") -> di
         "top_candidate": ev.get("top_candidate"),
         "operations": ev.get("operations", []),
     }
+    try:
+        result["fingerprint"] = quick_fingerprint(p)
+        result["content_identity"] = result["fingerprint"].get("content_identity", "")
+    except Exception:
+        result["content_identity"] = _content_identity(p)
+    return result
 
 
 MAX_SCAN_WORKERS = 5
@@ -249,8 +321,8 @@ def _scan_background(mode: str = "full"):
             if cached.get("top_candidate") and cached.get("status") in ("noop", "rename"):
                 try:
                     fp = quick_fingerprint(p)
-                    cached_fp = cached.get("fingerprint", {})
-                    if not fingerprint_changed({"fingerprint": cached_fp}, fp):
+                    # (fingerprint comparison now uses the cached item itself)
+                    if not fingerprint_changed(cached, fp):
                         with _progress_lock:
                             _scan_progress.results.append(cached)
                         skipped_count += 1
@@ -285,6 +357,7 @@ def _scan_background(mode: str = "full"):
                 r = future.result()
                 try:
                     r["fingerprint"] = quick_fingerprint(Path(path_str))
+                    r["content_identity"] = r["fingerprint"].get("content_identity", "")
                 except Exception:
                     pass
                 with _cache_lock:
@@ -301,6 +374,13 @@ def _scan_background(mode: str = "full"):
 
     with _progress_lock:
         _scan_progress.running = False
+    # Drop cache entries whose old path no longer exists (e.g. after an
+    # external folder rename).  Content-identity lookup above has already
+    # copied the previous match to the new path when the rescan succeeded.
+    with _cache_lock:
+        stale = [key for key in _scan_cache if not Path(key).exists()]
+        for key in stale:
+            _scan_cache.pop(key, None)
     _save_cache()
 
 
@@ -311,8 +391,7 @@ def api_folders():
     folders = _get_anime_folders()
     items = []
     for p in folders:
-        with _cache_lock:
-            cached = _scan_cache.get(str(p), {})
+        cached = _get_cached_entry(p)
         # check existence of assets
         nfo_exists = (p / "tvshow.nfo").exists()
         poster_exists = (p / "poster.jpg").exists()
@@ -391,8 +470,12 @@ def api_scan_one():
     p = _media_path(path_str)
     if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
+    cached_before = _get_cached_entry(p)
     result = _scan_one_impl(p, enrich=True, override_title=series_title)
     with _cache_lock:
+        old_path = cached_before.get("path", "")
+        if old_path and old_path != str(p) and result.get("status") != "error":
+            _scan_cache.pop(old_path, None)
         _scan_cache[str(p)] = result
     _save_cache()
     return result
@@ -413,6 +496,7 @@ def api_preview_one():
     except Exception as exc:
         return {"error": str(exc)}, 500
 
+    _inject_cached_candidate(scan, _get_cached_entry(p))
     if not scan.candidates:
         try:
             enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
@@ -450,8 +534,13 @@ def api_apply_one():
     if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
-    with _cache_lock:
-        cached = _scan_cache.get(path_str, {})
+    cached = _get_cached_entry(p)
+    if cached.get("operations"):
+        try:
+            if fingerprint_changed(cached, quick_fingerprint(p)):
+                cached["operations"] = []
+        except Exception:
+            pass
 
     # Fast path: use cached operations directly when no custom series_title
     if cached and cached.get("operations") and not series_title:
@@ -483,29 +572,11 @@ def api_apply_one():
         return {"error": str(exc)}, 500
 
     # Reuse cached candidate to avoid network API calls
-    if not scan.candidates:
-        cached_cand = cached.get("top_candidate")
-        if cached_cand:
-            from tmdb_scan_preview import Candidate
-            scan.candidates = [Candidate(
-                tmdb_id=cached_cand.get("tmdb_id", 0),
-                name=cached_cand.get("name", ""),
-                original_name=cached_cand.get("original_name", ""),
-                first_air_date=cached_cand.get("first_air_date", ""),
-                original_language=cached_cand.get("original_language", ""),
-                overview=cached_cand.get("overview", ""),
-                score=cached_cand.get("score", 0.99),
-                reasons=["reused_cached_candidate"],
-                source=cached_cand.get("source", ""),
-                source_id=cached_cand.get("source_id", ""),
-                zh_title=cached_cand.get("zh_title", ""),
-                raw_data=cached_cand.get("raw_data"),
-            )]
-        else:
-            try:
-                enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
-            except Exception:
-                print(traceback.format_exc(), flush=True)
+    if not _inject_cached_candidate(scan, cached):
+        try:
+            enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
+        except Exception:
+            print(traceback.format_exc(), flush=True)
 
     ev = evaluate_scan(scan, min_score=0.65,
                        series_title_source="tmdb", allow_fallback=True)
@@ -560,8 +631,24 @@ def api_rename_folder():
     try:
         src.rename(dst)
         with _cache_lock:
-            _scan_cache.pop(str(src), None)
+            cached = _scan_cache.pop(str(src), None)
             _scan_cache.pop(str(dst), None)
+            if isinstance(cached, dict):
+                cached = dict(cached)
+                cached["path"] = str(dst)
+                cached["name"] = new_name
+                # The old operations still point at the old path; clear them
+                # so the next preview is rebuilt, while keeping the metadata
+                # candidate stable.
+                cached["operations"] = []
+                try:
+                    cached["fingerprint"] = quick_fingerprint(dst)
+                    cached["content_identity"] = cached["fingerprint"].get(
+                        "content_identity", cached.get("content_identity", "")
+                    )
+                except Exception:
+                    cached["content_identity"] = cached.get("content_identity") or _content_identity(dst)
+                _scan_cache[str(dst)] = cached
         _save_cache()
         return {"success": True, "old_path": str(src), "new_path": str(dst),
                 "new_name": new_name}
@@ -584,6 +671,7 @@ def api_apply_all():
             folders.append(p)
     else:
         return {"error": "请选择要应用的项目"}, 400
+    folders = dedupe_series_folders(folders, prefer_nfo=True)
     results = []
     total_renamed = 0
     total_errors = 0
@@ -592,8 +680,13 @@ def api_apply_all():
         path_str = str(p)
         series_title = overrides.get(path_str, "")
 
-        with _cache_lock:
-            cached = _scan_cache.get(path_str, {})
+        cached = _get_cached_entry(p)
+        if cached.get("operations"):
+            try:
+                if fingerprint_changed(cached, quick_fingerprint(p)):
+                    cached["operations"] = []
+            except Exception:
+                pass
 
         # Fast path: use cached operations directly when no custom series_title
         if cached and cached.get("operations") and not series_title:
@@ -630,29 +723,11 @@ def api_apply_all():
             continue
 
         # Reuse cached candidate to avoid network API calls
-        if not scan.candidates:
-            cached_cand = cached.get("top_candidate")
-            if cached_cand:
-                from tmdb_scan_preview import Candidate
-                scan.candidates = [Candidate(
-                    tmdb_id=cached_cand.get("tmdb_id", 0),
-                    name=cached_cand.get("name", ""),
-                    original_name=cached_cand.get("original_name", ""),
-                    first_air_date=cached_cand.get("first_air_date", ""),
-                    original_language=cached_cand.get("original_language", ""),
-                    overview=cached_cand.get("overview", ""),
-                    score=cached_cand.get("score", 0.99),
-                    reasons=["reused_cached_candidate"],
-                    source=cached_cand.get("source", ""),
-                    source_id=cached_cand.get("source_id", ""),
-                    zh_title=cached_cand.get("zh_title", ""),
-                    raw_data=cached_cand.get("raw_data"),
-                )]
-            else:
-                try:
-                    enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
-                except Exception:
-                    print(traceback.format_exc(), flush=True)
+        if not _inject_cached_candidate(scan, cached):
+            try:
+                enrich_all_sources(scan, tmdb_api_key=_api_key(), anidb_cache=ANIDB_CACHE)
+            except Exception:
+                print(traceback.format_exc(), flush=True)
 
         ev = evaluate_scan(scan, min_score=0.65,
                            series_title_source="tmdb", allow_fallback=True)
@@ -703,7 +778,7 @@ def api_download_nfo():
     except Exception as exc:
         return {"error": str(exc)}, 500
 
-    if not scan.candidates:
+    if not _inject_cached_candidate(scan, _get_cached_entry(p)):
         try:
             enrich_all_sources(scan, tmdb_api_key=api_key, anidb_cache=ANIDB_CACHE)
         except Exception:
@@ -731,8 +806,7 @@ def api_download_poster():
     if not p or not p.is_dir():
         return {"error": "无效路径"}, 400
 
-    with _cache_lock:
-        cached = _scan_cache.get(path_str, {})
+    cached = _get_cached_entry(p)
     top = cached.get("top_candidate")
     if not top:
         return {"error": "该文件夹没有匹配的元数据，请先扫描"}, 400
@@ -815,10 +889,12 @@ def api_emby_link():
 
     total_created = total_skipped = total_errors = 0
     series_count = 0
+    seen_content_ids: set[str] = set()
 
     cache_prefix_old = ""
     cache_prefix_new = str(MEDIA_ROOT.parent).rstrip("/") + "/"
 
+    eligible_entries = []
     for _key, entry in cache_snapshot.items():
         if not isinstance(entry, dict):
             continue
@@ -826,10 +902,26 @@ def api_emby_link():
             continue
         if entry.get("status") not in ("noop", "rename"):
             continue
-        series_count += 1
+        eligible_entries.append(entry)
+    # Process entries with an existing metadata match first.  If several
+    # cache entries are hard-link duplicates, the matched/original one wins.
+    def entry_rank(entry: dict):
+        source_path = entry.get("path") or ""
+        try:
+            has_nfo = (Path(source_path) / "tvshow.nfo").exists()
+        except OSError:
+            has_nfo = False
+        return (not entry.get("top_candidate"), not has_nfo, source_path.lower())
+
+    eligible_entries.sort(key=entry_rank)
+
+    for entry in eligible_entries:
+        seen_before = len(seen_content_ids)
         c, s, e = process_entry(entry, output_root,
                                 cache_prefix_old, cache_prefix_new,
-                                dry_run=False)
+                                dry_run=False, seen_content_ids=seen_content_ids)
+        if len(seen_content_ids) > seen_before:
+            series_count += 1
         total_created += c
         total_skipped += s
         total_errors += e
